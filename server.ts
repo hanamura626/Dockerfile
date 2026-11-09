@@ -5,7 +5,7 @@ import * as net from 'net';
 import { promises as dnsPromises } from 'dns';
 import { URL } from 'url';
 
-// ============ ENV ============
+// ============ Environment ============
 const UUID = process.env.UUID || 'd1cf4b9c-3e57-085d-b34a-797fcf601381';
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const SHOW_LOG = !!process.env.SHOW_LOG;
@@ -13,17 +13,11 @@ const ALLOW_ANY_UUID = ['1', 'true', 'yes'].includes(
   (process.env.ALLOW_ANY_UUID || 'true').toLowerCase(),
 );
 
-// ============ UDP RELAY CONFIG ============
-// Contoh: 
-const UDP_RELAY_URL = process.env.UDP_RELAY_URL || 'wss://clineufp-production.up.railway.app/udp';
-const UDP_RELAY_SECRET = process.env.UDP_RELAY_SECRET || '';
-
 const UUID_BYTES = Buffer.from(UUID.replace(/-/g, ''), 'hex');
 
 function log(...a: any[]) { if (SHOW_LOG) console.log(...a); }
 function logErr(...a: any[]) { if (SHOW_LOG) console.error(...a); }
 
-// ============ Blokir Domain Speedtest ============
 const BLOCKED_DOMAINS = [
   'speedtest.net', 'fast.com', 'speedtest.cn', 'speed.cloudflare.com',
   'speedof.me', 'testmy.net', 'bandwidth.place', 'speed.io',
@@ -40,6 +34,8 @@ function isBlockedDomain(host?: string | null): boolean {
 // ============ Hashing / CRC / FNV ============
 const md5 = (d: Buffer) => crypto.createHash('md5').update(d).digest();
 const sha256 = (d: Buffer) => crypto.createHash('sha256').update(d).digest();
+const hmacSha256 = (k: Buffer, d: Buffer) =>
+  crypto.createHmac('sha256', k).update(d).digest();
 
 function crc32(d: Buffer): number {
   let c = 0xffffffff;
@@ -49,6 +45,7 @@ function crc32(d: Buffer): number {
   }
   return (c ^ 0xffffffff) >>> 0;
 }
+
 function fnv1a32(d: Buffer): number {
   let h = 0x811c9dc5;
   for (let i = 0; i < d.length; i++) {
@@ -60,6 +57,7 @@ function fnv1a32(d: Buffer): number {
 
 // ============ VMess KDF ============
 type HashFn = (d: Buffer) => Buffer;
+
 function hmacWithHash(hashFn: HashFn, key: Buffer, data: Buffer): Buffer {
   let k = key;
   if (k.length > 64) k = hashFn(k);
@@ -72,6 +70,7 @@ function hmacWithHash(hashFn: HashFn, key: Buffer, data: Buffer): Buffer {
   }
   return hashFn(Buffer.concat([opad, hashFn(Buffer.concat([ipad, data]))]));
 }
+
 function vmessKdf(key: Buffer, ...paths: (string | Buffer)[]): Buffer {
   let fn: HashFn = (d) =>
     crypto.createHmac('sha256', Buffer.from('VMess AEAD KDF')).update(d).digest();
@@ -87,7 +86,7 @@ const vmessKdf16 = (key: Buffer, ...paths: (string | Buffer)[]) =>
 const vmessCmdKey = (u: Buffer) =>
   md5(Buffer.concat([u, Buffer.from('c48619fe-8f02-49e0-b9e9-edf763e17e21')]));
 
-// ============ Konstanta ============
+// ============ Constants ============
 const SEC_AES128_GCM = 3;
 const SEC_CHACHA20_POLY1305 = 4;
 const SEC_NONE = 5;
@@ -99,7 +98,7 @@ const OPT_GLOBAL_PADDING = 0x08;
 const OPT_AUTHENTICATED_LENGTH = 0x10;
 
 const ATYP_IPV4 = 0x01, ATYP_DOMAIN = 0x02, ATYP_IPV6 = 0x03;
-const CMD_TCP = 0x01, CMD_UDP = 0x02, CMD_MUX = 0x03;
+const CMD_TCP = 0x01, CMD_MUX = 0x03;
 
 const KDF_AUTH_ID = 'AES Auth ID Encryption';
 const KDF_HDR_LEN_KEY = 'VMess Header AEAD Key_Length';
@@ -112,7 +111,7 @@ const KDF_RESP_KEY = 'AEAD Resp Header Key';
 const KDF_RESP_IV = 'AEAD Resp Header IV';
 const KDF_AUTH_LEN = 'auth_len';
 
-// ============ AEAD Helpers ============
+// ============ AEAD helpers (FIXED) ============
 function chachaKey(k16: Buffer): Buffer {
   const a = md5(k16);
   return Buffer.concat([a, md5(a)]);
@@ -120,40 +119,56 @@ function chachaKey(k16: Buffer): Buffer {
 function normalizeAeadKey(sec: number, key: Buffer): Buffer {
   return sec === SEC_CHACHA20_POLY1305 ? chachaKey(key) : key.subarray(0, 16);
 }
+
 function aeadSeal(sec: number, key: Buffer, nonce: Buffer, plain: Buffer, aad?: Buffer): Buffer {
   const alg = sec === SEC_AES128_GCM ? 'aes-128-gcm' : 'chacha20-poly1305';
-  const cipher = crypto.createCipheriv(alg, normalizeAeadKey(sec, key), nonce) as crypto.CipherGCM;
+  const cipher = crypto.createCipheriv(
+    alg,
+    normalizeAeadKey(sec, key),
+    nonce,
+  ) as crypto.CipherGCM;
   if (aad) cipher.setAAD(aad);
   return Buffer.concat([cipher.update(plain), cipher.final(), cipher.getAuthTag()]);
 }
+
 function aeadOpen(sec: number, key: Buffer, nonce: Buffer, sealed: Buffer, aad?: Buffer): Buffer {
   const alg = sec === SEC_AES128_GCM ? 'aes-128-gcm' : 'chacha20-poly1305';
   const tag = sealed.subarray(sealed.length - 16);
   const ct = sealed.subarray(0, sealed.length - 16);
-  const d = crypto.createDecipheriv(alg, normalizeAeadKey(sec, key), nonce) as crypto.DecipherGCM;
+  const d = crypto.createDecipheriv(
+    alg,
+    normalizeAeadKey(sec, key),
+    nonce,
+  ) as crypto.DecipherGCM;
   if (aad) d.setAAD(aad);
   d.setAuthTag(tag);
   return Buffer.concat([d.update(ct), d.final()]);
 }
+
 function aesEcbDecryptBlock(key: Buffer, block: Buffer): Buffer {
   const d = crypto.createDecipheriv('aes-128-ecb', key.subarray(0, 16), null);
   d.setAutoPadding(false);
   return Buffer.concat([d.update(block), d.final()]);
 }
 
-// ============ SHAKE128 ============
+// ============ SHAKE128 XOF ============
 class ShakeSizeParser {
   private buf: Buffer;
   private pos = 0;
   constructor(seed: Buffer) {
-    this.buf = crypto.createHash('shake128', { outputLength: 131072 }).update(seed).digest() as Buffer;
+    this.buf = crypto
+      .createHash('shake128', { outputLength: 131072 })
+      .update(seed)
+      .digest() as Buffer;
   }
   private nw(): number {
     const b = this.buf.subarray(this.pos, this.pos + 2);
     this.pos += 2;
     return (b[0] << 8) | b[1];
   }
-  decodeSize(d: Buffer): number { return (((d[0] << 8) | d[1]) ^ this.nw()) & 0xffff; }
+  decodeSize(d: Buffer): number {
+    return (((d[0] << 8) | d[1]) ^ this.nw()) & 0xffff;
+  }
   encodeSize(s: number): Buffer {
     const v = (s ^ this.nw()) & 0xffff;
     return Buffer.from([v >> 8, v & 0xff]);
@@ -174,7 +189,7 @@ class NonceCounter {
   }
 }
 
-// ============ VMess Header ============
+// ============ VMess header parser ============
 interface VmessHeader {
   command: number;
   address: string;
@@ -223,6 +238,7 @@ function tryParseVmessHeader(
   let authPlain: Buffer;
   try { authPlain = aesEcbDecryptBlock(vmessKdf16(cmdKey, KDF_AUTH_ID), authId); }
   catch { return null; }
+
   const ts = Number(authPlain.readBigInt64BE(0));
   if (crc32(authPlain.subarray(0, 12)) !== authPlain.readUInt32BE(12)) return null;
   if (Math.abs(ts - nowSec) > 120) return null;
@@ -230,6 +246,7 @@ function tryParseVmessHeader(
 
   const encLen = data.subarray(16, 34);
   const connNonce = data.subarray(34, 42);
+
   let plainLen: number;
   try {
     const lp = aeadOpen(SEC_AES128_GCM,
@@ -241,6 +258,7 @@ function tryParseVmessHeader(
 
   const total = 42 + plainLen + 16;
   if (data.length < total) return null;
+
   let plain: Buffer;
   try {
     plain = aeadOpen(SEC_AES128_GCM,
@@ -255,11 +273,13 @@ function tryParseVmessHeader(
   let option = plain[34];
   const wireSec = plain[35] & 0x0f;
   const command = plain[37];
+
   let security = wireSec;
   if (security === SEC_ZERO) {
     security = SEC_NONE;
     option &= ~(OPT_CHUNK_STREAM | OPT_CHUNK_MASKING | OPT_GLOBAL_PADDING | OPT_AUTHENTICATED_LENGTH);
   }
+
   let p = 38;
   let address = 'v1.mux.cool', port = 0, atyp = ATYP_DOMAIN;
   if (command !== CMD_MUX) {
@@ -269,10 +289,12 @@ function tryParseVmessHeader(
     if (!r) throw new Error('truncated destination');
     [address, p] = r;
   }
+
   const cp = plain.length - 4;
   if (fnv1a32(plain.subarray(0, cp)) !== plain.readUInt32BE(cp)) {
     throw new Error('invalid VMess checksum');
   }
+
   return {
     command, address, port, addressType: atyp,
     option, security, wireSecurity: wireSec,
@@ -283,7 +305,7 @@ function tryParseVmessHeader(
   };
 }
 
-// ============ VMess Body Decoder / Encoder ============
+// ============ VMess body decoder / encoder ============
 class VmessBodyDecoder {
   private h: VmessHeader;
   private pending = Buffer.alloc(0);
@@ -429,7 +451,7 @@ function encodeVmessResponseHeader(h: VmessHeader): Buffer {
   ]);
 }
 
-// ============ Network Helpers ============
+// ============ Network helpers ============
 async function resolveHost(host: string): Promise<string> {
   if (IPV4_REGEX.test(host)) return host;
   try {
@@ -459,119 +481,20 @@ function connectTcp(host: string, port: number): Promise<net.Socket> {
   });
 }
 
-// ============ UDP Relay Session (COCOK dengan relay user) ============
-// Satu instance = satu WS ke relay = satu target UDP (host:port).
-// Relay menerima/mengirim raw UDP payload — tanpa framing.
-class UdpRelaySession {
-  private ws: WebSocket | null = null;
-  private ready = false;
-  private pending: Buffer[] = [];
-  private onData: (data: Buffer) => void;
-  private onClose: () => void;
-  private closed = false;
-
-  constructor(host: string, port: number, onData: (data: Buffer) => void, onClose: () => void) {
-    this.onData = onData;
-    this.onClose = onClose;
-    this.connect(host, port);
-  }
-
-  private connect(host: string, port: number) {
-    if (!UDP_RELAY_URL) {
-      logErr('[UDP] UDP_RELAY_URL belum diset di env');
-      queueMicrotask(() => this.finish());
-      return;
-    }
-    try {
-      const u = new URL(UDP_RELAY_URL);
-      // IPv6 target harus dibungkus bracket: [::1]:53
-      const target = host.includes(':') ? `[${host}]:${port}` : `${host}:${port}`;
-      u.searchParams.set('target', target);
-
-      const headers: Record<string, string> = {};
-      if (UDP_RELAY_SECRET) headers['X-Relay-Secret'] = UDP_RELAY_SECRET;
-
-      const ws = new WebSocket(u.toString(), { headers });
-      ws.binaryType = 'arraybuffer';
-      this.ws = ws;
-
-      ws.on('open', () => {
-        this.ready = true;
-        log(`[UDP] Relay connected → target=${target}`);
-        // flush antrian
-        for (const p of this.pending) { try { ws.send(p); } catch (_) {} }
-        this.pending = [];
-      });
-
-      ws.on('message', (data: ArrayBuffer | Buffer) => {
-        const buf = Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer);
-        if (buf.length === 0) return;
-        try { this.onData(buf); } catch (e) { logErr('[UDP] onData error', e); }
-      });
-
-      ws.on('close', () => {
-        log('[UDP] Relay closed');
-        this.finish();
-      });
-      ws.on('error', (err) => {
-        logErr('[UDP] Relay error', err);
-        this.finish();
-      });
-    } catch (e) {
-      logErr('[UDP] connect failed', e);
-      queueMicrotask(() => this.finish());
-    }
-  }
-
-  send(payload: Buffer) {
-    if (this.closed) return;
-    if (payload.length === 0) return; // skip empty UDP
-    if (this.ready && this.ws && this.ws.readyState === WebSocket.OPEN) {
-      try { this.ws.send(payload); } catch (e) { logErr('[UDP] send fail', e); }
-    } else {
-      // buffer sementara, maksimal 64 paket
-      if (this.pending.length < 64) this.pending.push(payload);
-    }
-  }
-
-  close() {
-    this.finish();
-  }
-
-  private finish() {
-    if (this.closed) return;
-    this.closed = true;
-    if (this.ws) {
-      try { this.ws.close(); } catch {}
-      this.ws = null;
-    }
-    try { this.onClose(); } catch {}
-  }
-}
-
-// ============ Prepared Connection ============
+// ============ Handlers ============
 interface Prepared {
-  socket: net.Socket | null;
+  socket: net.Socket;
   initial?: Buffer;
   decoder?: VmessBodyDecoder;
   encoder?: VmessBodyEncoder;
-  udpRelay?: UdpRelaySession;
-  isUdp?: boolean;
 }
 
-// ============ VLESS Handler ============
 async function prepareVless(ws: WebSocket, msg: Buffer): Promise<Prepared | null> {
   if (msg.length < 18) return null;
   const version = msg[0];
   const clientUuid = msg.subarray(1, 17);
   if (!ALLOW_ANY_UUID && !clientUuid.equals(UUID_BYTES)) return null;
-
-  const optLen = msg[17];
-  const cmdIndex = 18 + optLen;
-  if (msg.length < cmdIndex + 1) return null;
-  const command = msg[cmdIndex];
-
-  let i = cmdIndex + 1;
+  let i = 18 + msg[17] + 1;
   if (msg.length < i + 3) return null;
   const port = msg.readUInt16BE(i); i += 2;
   const atyp = msg[i]; i += 1;
@@ -593,38 +516,14 @@ async function prepareVless(ws: WebSocket, msg: Buffer): Promise<Prepared | null
   } else return null;
 
   if (isBlockedDomain(host)) return null;
-
-  // Kirim VLESS response header (version + 0) ke client
   try { ws.send(Buffer.from([version, 0])); } catch { return null; }
 
-  // ========== UDP ==========
-  if (command === CMD_UDP) {
-    if (!UDP_RELAY_URL) {
-      logErr('[VLESS] CMD_UDP tapi UDP_RELAY_URL tidak diset — menutup koneksi');
-      try { ws.close(); } catch {}
-      return null;
-    }
-    const session = new UdpRelaySession(
-      host, port,
-      (data) => { try { ws.send(data); } catch {} },   // relay → client (raw)
-      () => { try { ws.close(); } catch {} },          // relay closed → tutup client
-    );
-    return {
-      socket: null,
-      udpRelay: session,
-      isUdp: true,
-      initial: msg.subarray(i),
-    };
-  }
-
-  // ========== TCP ==========
   const target = await resolveHost(host);
   let socket: net.Socket;
   try { socket = await connectTcp(target, port); } catch { return null; }
-  return { socket, initial: msg.subarray(i), isUdp: false };
+  return { socket, initial: msg.subarray(i) };
 }
 
-// ============ Trojan Handler (TCP only, tanpa UDP) ============
 async function prepareTrojan(ws: WebSocket, msg: Buffer): Promise<Prepared | null> {
   if (msg.length < 58) return null;
   const received = msg.subarray(0, 56).toString('ascii');
@@ -663,10 +562,9 @@ async function prepareTrojan(ws: WebSocket, msg: Buffer): Promise<Prepared | nul
   const target = await resolveHost(host);
   let socket: net.Socket;
   try { socket = await connectTcp(target, port); } catch { return null; }
-  return { socket, initial: msg.subarray(off), isUdp: false };
+  return { socket, initial: msg.subarray(off) };
 }
 
-// ============ VMess Handler ============
 async function prepareVmess(ws: WebSocket, msg: Buffer): Promise<Prepared | null> {
   let header: VmessHeader | null;
   try { header = tryParseVmessHeader(msg, UUID_BYTES); }
@@ -674,41 +572,6 @@ async function prepareVmess(ws: WebSocket, msg: Buffer): Promise<Prepared | null
   if (!header) return null;
   if (isBlockedDomain(header.address)) return null;
 
-  // ========== UDP ==========
-  if (header.command === CMD_UDP) {
-    if (!UDP_RELAY_URL) {
-      logErr('[VMESS] CMD_UDP tapi UDP_RELAY_URL tidak diset — menutup koneksi');
-      try { ws.close(); } catch {}
-      return null;
-    }
-    const decoder = new VmessBodyDecoder(header);
-    const encoder = new VmessBodyEncoder(header);
-
-    // Kirim VMess response header dulu
-    try { ws.send(encodeVmessResponseHeader(header)); } catch { return null; }
-
-    const session = new UdpRelaySession(
-      header.address, header.port,
-      (data) => {   // relay → client: bungkus ke chunk VMess
-        try {
-          const payload = encoder.encode(data);
-          if (payload.length) ws.send(payload);
-        } catch (e) { logErr('[VMESS UDP ENC]', e); }
-      },
-      () => { try { ws.close(); } catch {} },
-    );
-
-    return {
-      socket: null,
-      udpRelay: session,
-      decoder,
-      encoder,
-      isUdp: true,
-      initial: msg.subarray(header.headerLength),
-    };
-  }
-
-  // ========== TCP ==========
   const decoder = new VmessBodyDecoder(header);
   const encoder = new VmessBodyEncoder(header);
   try { ws.send(encodeVmessResponseHeader(header)); } catch { return null; }
@@ -716,10 +579,10 @@ async function prepareVmess(ws: WebSocket, msg: Buffer): Promise<Prepared | null
   const target = await resolveHost(header.address);
   let socket: net.Socket;
   try { socket = await connectTcp(target, header.port); } catch { return null; }
-  return { socket, initial: msg.subarray(header.headerLength), decoder, encoder, isUdp: false };
+  return { socket, initial: msg.subarray(header.headerLength), decoder, encoder };
 }
 
-// ============ HTTP + WebSocket Server ============
+// ============ HTTP + WebSocket server ============
 const server = createServer((req: IncomingMessage, res: ServerResponse) => {
   const path = new URL(req.url || '/', 'http://x').pathname;
   if (path === '/') {
@@ -790,46 +653,29 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
       if (closed) return;
       closed = true;
       try { ws.close(); } catch {}
-      if (prepared!.socket) try { prepared!.socket.destroy(); } catch {}
-      if (prepared!.udpRelay) try { prepared!.udpRelay.close(); } catch {}
+      try { prepared!.socket.destroy(); } catch {}
     };
 
     bufferHandler = (data: Buffer) => {
       if (closed) return;
       try {
-        if (prepared!.isUdp) {
-          if (prepared!.decoder) {
-            // VMess UDP: decode chunked body → tiap packet raw → relay
-            for (const p of prepared!.decoder.push(data)) {
-              prepared!.udpRelay!.send(p);
-            }
-          } else {
-            // VLESS UDP: 1 WS frame = 1 raw UDP packet → relay
-            prepared!.udpRelay!.send(data);
-          }
+        if (prepared!.decoder) {
+          for (const p of prepared!.decoder.push(data)) prepared!.socket.write(p);
         } else {
-          // TCP
-          if (prepared!.decoder) {
-            for (const p of prepared!.decoder.push(data)) prepared!.socket!.write(p);
-          } else {
-            prepared!.socket!.write(data);
-          }
+          prepared!.socket.write(data);
         }
-      } catch (e) { logErr('[WS->TARGET]', e); cleanup(); }
+      } catch (e) { logErr('[WS->TCP]', e); cleanup(); }
     };
 
-    if (!prepared.isUdp && prepared.socket) {
-      prepared.socket.on('data', (data: Buffer) => {
-        if (closed) return;
-        try {
-          const payload = prepared!.encoder ? prepared!.encoder.encode(data) : data;
-          if (payload.length) ws.send(payload);
-        } catch (e) { logErr('[TARGET->WS]', e); cleanup(); }
-      });
-      prepared.socket.once('close', cleanup);
-      prepared.socket.once('error', cleanup);
-    }
-
+    prepared.socket.on('data', (data: Buffer) => {
+      if (closed) return;
+      try {
+        const payload = prepared!.encoder ? prepared!.encoder.encode(data) : data;
+        if (payload.length) ws.send(payload);
+      } catch (e) { logErr('[TCP->WS]', e); cleanup(); }
+    });
+    prepared.socket.once('close', cleanup);
+    prepared.socket.once('error', cleanup);
     ws.once('close', cleanup);
     ws.once('error', cleanup);
 
@@ -840,7 +686,5 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
 });
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[VLESS/Trojan/VMess + UDP Relay] listening on 0.0.0.0:${PORT}`);
-  console.log(`  UDP_RELAY_URL     : ${UDP_RELAY_URL || '(disabled)'}`);
-  console.log(`  UDP_RELAY_SECRET  : ${UDP_RELAY_SECRET ? 'set' : 'not set'}`);
+  console.log(`[VLESS/Trojan/VMess] listening on 0.0.0.0:${PORT}`);
 });
