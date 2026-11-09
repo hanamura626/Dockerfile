@@ -1,4 +1,7 @@
 {
-  "framework": "go",
+  "version": 2,
+  "builds": [
+    { "src": "Dockerfile", "use": "@vercel/static-build" }
+  ],
   "regions": ["sin1"]
 }
