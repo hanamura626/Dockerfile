@@ -111,7 +111,7 @@ const KDF_RESP_KEY = 'AEAD Resp Header Key';
 const KDF_RESP_IV = 'AEAD Resp Header IV';
 const KDF_AUTH_LEN = 'auth_len';
 
-// ============ AEAD helpers ============
+// ============ AEAD helpers (FIXED) ============
 function chachaKey(k16: Buffer): Buffer {
   const a = md5(k16);
   return Buffer.concat([a, md5(a)]);
@@ -119,28 +119,39 @@ function chachaKey(k16: Buffer): Buffer {
 function normalizeAeadKey(sec: number, key: Buffer): Buffer {
   return sec === SEC_CHACHA20_POLY1305 ? chachaKey(key) : key.subarray(0, 16);
 }
+
 function aeadSeal(sec: number, key: Buffer, nonce: Buffer, plain: Buffer, aad?: Buffer): Buffer {
   const alg = sec === SEC_AES128_GCM ? 'aes-128-gcm' : 'chacha20-poly1305';
-  const cipher = crypto.createCipheriv(alg, normalizeAeadKey(sec, key), nonce);
+  const cipher = crypto.createCipheriv(
+    alg,
+    normalizeAeadKey(sec, key),
+    nonce,
+  ) as crypto.CipherGCM;
   if (aad) cipher.setAAD(aad);
   return Buffer.concat([cipher.update(plain), cipher.final(), cipher.getAuthTag()]);
 }
+
 function aeadOpen(sec: number, key: Buffer, nonce: Buffer, sealed: Buffer, aad?: Buffer): Buffer {
   const alg = sec === SEC_AES128_GCM ? 'aes-128-gcm' : 'chacha20-poly1305';
   const tag = sealed.subarray(sealed.length - 16);
   const ct = sealed.subarray(0, sealed.length - 16);
-  const d = crypto.createDecipheriv(alg, normalizeAeadKey(sec, key), nonce);
+  const d = crypto.createDecipheriv(
+    alg,
+    normalizeAeadKey(sec, key),
+    nonce,
+  ) as crypto.DecipherGCM;
   if (aad) d.setAAD(aad);
   d.setAuthTag(tag);
   return Buffer.concat([d.update(ct), d.final()]);
 }
+
 function aesEcbDecryptBlock(key: Buffer, block: Buffer): Buffer {
   const d = crypto.createDecipheriv('aes-128-ecb', key.subarray(0, 16), null);
   d.setAutoPadding(false);
   return Buffer.concat([d.update(block), d.final()]);
 }
 
-// ============ SHAKE128 XOF (stream via pre-generated buffer) ============
+// ============ SHAKE128 XOF ============
 class ShakeSizeParser {
   private buf: Buffer;
   private pos = 0;
@@ -571,7 +582,7 @@ async function prepareVmess(ws: WebSocket, msg: Buffer): Promise<Prepared | null
   return { socket, initial: msg.subarray(header.headerLength), decoder, encoder };
 }
 
-// ============ WebSocket server ============
+// ============ HTTP + WebSocket server ============
 const server = createServer((req: IncomingMessage, res: ServerResponse) => {
   const path = new URL(req.url || '/', 'http://x').pathname;
   if (path === '/') {
@@ -597,7 +608,6 @@ server.on('upgrade', (req, socket, head) => {
 wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
   const path = new URL(req.url || '/', 'http://x').pathname;
 
-  // Buffer messages until we're ready
   const pending: Buffer[] = [];
   let firstMsgResolve: ((b: Buffer) => void) | null = null;
   let firstMsgReject: ((e: Error) => void) | null = null;
@@ -675,6 +685,6 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
   })();
 });
 
-server.listen(PORT, () => {
-  console.log(`[VLESS/Trojan/VMess] listening on :${PORT}`);
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`[VLESS/Trojan/VMess] listening on 0.0.0.0:${PORT}`);
 });
