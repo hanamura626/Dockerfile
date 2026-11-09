@@ -1,7 +1,4 @@
 {
-  "version": 2,
-  "builds": [
-    { "src": "Dockerfile", "use": "@vercel/static-build" }
-  ],
+  "framework": "container",
   "regions": ["sin1"]
 }
