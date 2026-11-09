@@ -7,7 +7,6 @@ import (
 	"crypto/md5"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/sha512"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
@@ -29,14 +28,14 @@ import (
 
 // ==================== Environment ====================
 var (
-	UUID          = getEnv("UUID", "d1cf4b9c-3e57-085d-b34a-797fcf601381")
-	SubPath       = getEnv("SUB_PATH", "vercel")
-	Name          = getEnv("NAME", "Vercel-Node")
-	AllowAnyUUID  = getEnv("ALLOW_ANY_UUID", "true") == "true"
-	ServerAddr    = strings.TrimSpace(os.Getenv("SERVER_ADDR"))
-	WSHost        = strings.TrimSpace(os.Getenv("WS_HOST"))
-	WSSNI         = strings.TrimSpace(os.Getenv("WS_SNI"))
-	ShowLog       = os.Getenv("SHOW_LOG") == "true"
+	UUID         = getEnv("UUID", "d1cf4b9c-3e57-085d-b34a-797fcf601381")
+	SubPath      = getEnv("SUB_PATH", "vercel")
+	Name         = getEnv("NAME", "Vercel-Node")
+	AllowAnyUUID = getEnv("ALLOW_ANY_UUID", "true") == "true"
+	ServerAddr   = strings.TrimSpace(os.Getenv("SERVER_ADDR"))
+	WSHost       = strings.TrimSpace(os.Getenv("WS_HOST"))
+	WSSNI        = strings.TrimSpace(os.Getenv("WS_SNI"))
+	ShowLog      = os.Getenv("SHOW_LOG") == "true"
 )
 
 func getEnv(key, fallback string) string {
@@ -142,7 +141,9 @@ func handleVLESS(ws *websocket.Conn, msg []byte) bool {
 		return false
 	}
 
-	ws.WriteMessage(websocket.BinaryMessage, []byte{version, 0})
+	if err := ws.WriteMessage(websocket.BinaryMessage, []byte{version, 0}); err != nil {
+		return false
+	}
 
 	target := resolveHost(host)
 	conn, err := net.Dial("tcp", net.JoinHostPort(target, fmt.Sprint(port)))
@@ -152,7 +153,9 @@ func handleVLESS(ws *websocket.Conn, msg []byte) bool {
 	defer conn.Close()
 
 	if i < len(msg) {
-		conn.Write(msg[i:])
+		if _, err := conn.Write(msg[i:]); err != nil {
+			return false
+		}
 	}
 
 	bridge(ws, conn)
@@ -236,47 +239,54 @@ func handleTrojan(ws *websocket.Conn, msg []byte) bool {
 	defer conn.Close()
 
 	if off < len(msg) {
-		conn.Write(msg[off:])
+		if _, err := conn.Write(msg[off:]); err != nil {
+			return false
+		}
 	}
 
 	bridge(ws, conn)
 	return true
 }
 
-// ==================== VMess AEAD ====================
-type vmessHeader struct {
-	Command        byte
-	Address        string
-	Port           uint16
-	AddressType    byte
-	Option         byte
-	Security       byte
-	WireSecurity   byte
-	RequestBodyIV  []byte
-	RequestBodyKey []byte
-	ResponseHeader byte
-	HeaderLength   int
-	AuthID         []byte
-	ResponseBodyKey []byte
-	ResponseBodyIV  []byte
+// ==================== VMess AEAD: KDF ====================
+// Nested-HMAC construction (sesuai v2fly / Python asli)
+func hmacWithHash(hashFn func([]byte) []byte, key, data []byte) []byte {
+	k := key
+	if len(k) > 64 {
+		k = hashFn(k)
+	}
+	kb := make([]byte, 64)
+	copy(kb, k)
+	ipad := make([]byte, 64)
+	opad := make([]byte, 64)
+	for i := 0; i < 64; i++ {
+		ipad[i] = kb[i] ^ 0x36
+		opad[i] = kb[i] ^ 0x5c
+	}
+	inner := make([]byte, 64+len(data))
+	copy(inner, ipad)
+	copy(inner[64:], data)
+	innerHash := hashFn(inner)
+	outer := make([]byte, 64+len(innerHash))
+	copy(outer, opad)
+	copy(outer[64:], innerHash)
+	return hashFn(outer)
 }
 
 func vmessKDF(key []byte, paths ...string) []byte {
-	var h func([]byte) []byte
-	h = func(data []byte) []byte {
+	fn := func(data []byte) []byte {
 		mac := hmac.New(sha256.New, []byte("VMess AEAD KDF"))
 		mac.Write(data)
 		return mac.Sum(nil)
 	}
 	for _, p := range paths {
-		prev := h
-		h = func(data []byte) []byte {
-			mac := hmac.New(sha256.New, []byte(p))
-			mac.Write(prev(data))
-			return mac.Sum(nil)
+		prevFn := fn
+		pathBytes := []byte(p)
+		fn = func(data []byte) []byte {
+			return hmacWithHash(prevFn, pathBytes, data)
 		}
 	}
-	return h(key)
+	return fn(key)
 }
 
 func vmessKDF16(key []byte, paths ...string) []byte {
@@ -290,6 +300,24 @@ func vmessCmdKey(uuid []byte) []byte {
 	return h.Sum(nil)
 }
 
+// ==================== VMess Header ====================
+type vmessHeader struct {
+	Command         byte
+	Address         string
+	Port            uint16
+	AddressType     byte
+	Option          byte
+	Security        byte
+	WireSecurity    byte
+	RequestBodyIV   []byte
+	RequestBodyKey  []byte
+	ResponseHeader  byte
+	HeaderLength    int
+	AuthID          []byte
+	ResponseBodyKey []byte
+	ResponseBodyIV  []byte
+}
+
 func tryParseVMessHeader(data []byte, uuid []byte) (*vmessHeader, error) {
 	if len(data) < 42 {
 		return nil, fmt.Errorf("too short")
@@ -298,16 +326,15 @@ func tryParseVMessHeader(data []byte, uuid []byte) (*vmessHeader, error) {
 	authID := data[:16]
 
 	authKey := vmessKDF16(cmdKey, "AES Auth ID Encryption")
-	block, _ := aes.NewCipher(authKey)
+	block, err := aes.NewCipher(authKey)
+	if err != nil {
+		return nil, err
+	}
 	authPlain := make([]byte, 16)
 	block.Decrypt(authPlain, authID)
 
-	if len(authPlain) < 16 {
-		return nil, fmt.Errorf("invalid auth")
-	}
 	ts := int64(binary.BigEndian.Uint64(authPlain[:8]))
-	now := time.Now().Unix()
-	if abs(ts-now) > 120 {
+	if abs(ts-time.Now().Unix()) > 120 {
 		return nil, fmt.Errorf("timestamp out of range")
 	}
 
@@ -317,8 +344,8 @@ func tryParseVMessHeader(data []byte, uuid []byte) (*vmessHeader, error) {
 	lenKey := vmessKDF16(cmdKey, "VMess Header AEAD Key_Length", string(authID), string(connNonce))
 	lenIV := vmessKDF(cmdKey, "VMess Header AEAD Nonce_Length", string(authID), string(connNonce))[:12]
 
-	lenAEAD, _ := aes.NewCipher(lenKey)
-	lenGCM, _ := cipher.NewGCM(lenAEAD)
+	lenBlock, _ := aes.NewCipher(lenKey)
+	lenGCM, _ := cipher.NewGCM(lenBlock)
 	lenPlain, err := lenGCM.Open(nil, lenIV, encLen, authID)
 	if err != nil {
 		return nil, err
@@ -331,8 +358,8 @@ func tryParseVMessHeader(data []byte, uuid []byte) (*vmessHeader, error) {
 
 	hdrKey := vmessKDF16(cmdKey, "VMess Header AEAD Key", string(authID), string(connNonce))
 	hdrIV := vmessKDF(cmdKey, "VMess Header AEAD Nonce", string(authID), string(connNonce))[:12]
-	hdrAEAD, _ := aes.NewCipher(hdrKey)
-	hdrGCM, _ := cipher.NewGCM(hdrAEAD)
+	hdrBlock, _ := aes.NewCipher(hdrKey)
+	hdrGCM, _ := cipher.NewGCM(hdrBlock)
 	plain, err := hdrGCM.Open(nil, hdrIV, data[42:total], authID)
 	if err != nil {
 		return nil, err
@@ -345,8 +372,8 @@ func tryParseVMessHeader(data []byte, uuid []byte) (*vmessHeader, error) {
 	wireSec := plain[35] & 0x0f
 	command := plain[37]
 	security := wireSec
-	if security == 6 { // ZERO
-		security = 5 // NONE
+	if security == 6 {
+		security = 5
 		option &= ^byte(0x01 | 0x04 | 0x08 | 0x10)
 	}
 
@@ -354,7 +381,7 @@ func tryParseVMessHeader(data []byte, uuid []byte) (*vmessHeader, error) {
 	var address string
 	var port uint16
 	atyp := byte(2)
-	if command != 3 { // MUX
+	if command != 3 {
 		port = binary.BigEndian.Uint16(plain[p : p+2])
 		p += 2
 		atyp = plain[p]
@@ -376,6 +403,9 @@ func tryParseVMessHeader(data []byte, uuid []byte) (*vmessHeader, error) {
 		}
 	}
 
+	rbkArr := sha256.Sum256(rbk)
+	rbiArr := sha256.Sum256(rbi)
+
 	return &vmessHeader{
 		Command:         command,
 		Address:         address,
@@ -389,8 +419,8 @@ func tryParseVMessHeader(data []byte, uuid []byte) (*vmessHeader, error) {
 		ResponseHeader:  respHeader,
 		HeaderLength:    total,
 		AuthID:          authID,
-		ResponseBodyKey: sha256.Sum256(rbk)[:16],
-		ResponseBodyIV:  sha256.Sum256(rbi)[:16],
+		ResponseBodyKey: rbkArr[:16],
+		ResponseBodyIV:  rbiArr[:16],
 	}, nil
 }
 
@@ -401,21 +431,21 @@ func abs(x int64) int64 {
 	return x
 }
 
-// ---- VMess Body Decoder ----
+// ==================== VMess Body Decoder ====================
 type vmessDecoder struct {
-	header      *vmessHeader
-	pending     []byte
-	awaiting    bool
-	nextSize    int
-	nextPadding int
-	done        bool
-	zeroRaw     bool
-	sizeShake   *shakeParser
+	header       *vmessHeader
+	pending      []byte
+	awaiting     bool
+	nextSize     int
+	nextPadding  int
+	done         bool
+	zeroRaw      bool
+	sizeShake    *shakeParser
 	paddingShake *shakeParser
-	bodyNonce   *nonceCounter
-	lengthNonce *nonceCounter
-	authLength  bool
-	authLenKey  []byte
+	bodyNonce    *nonceCounter
+	lengthNonce  *nonceCounter
+	authLength   bool
+	authLenKey   []byte
 }
 
 func newVMessDecoder(h *vmessHeader) *vmessDecoder {
@@ -508,7 +538,7 @@ func (d *vmessDecoder) push(chunk []byte) ([][]byte, error) {
 	return out, nil
 }
 
-// ---- VMess Body Encoder ----
+// ==================== VMess Body Encoder ====================
 type vmessEncoder struct {
 	header       *vmessHeader
 	responseKey  []byte
@@ -600,7 +630,7 @@ func (e *vmessEncoder) unit(p []byte) []byte {
 	return out
 }
 
-// ---- VMess Response Header ----
+// ==================== VMess Response Header ====================
 func encodeVMessResponseHeader(h *vmessHeader) []byte {
 	plain := []byte{h.ResponseHeader, 0, 0, 0}
 	lenPlain := []byte{0, byte(len(plain))}
@@ -618,12 +648,21 @@ func encodeVMessResponseHeader(h *vmessHeader) []byte {
 
 // ==================== AEAD Helper ====================
 func openAEAD(security byte, key, nonce, sealed []byte) ([]byte, error) {
-	if security == 3 { // AES-128-GCM
-		block, _ := aes.NewCipher(key[:16])
-		gcm, _ := cipher.NewGCM(block)
+	if security == 3 {
+		block, err := aes.NewCipher(key[:16])
+		if err != nil {
+			return nil, err
+		}
+		gcm, err := cipher.NewGCM(block)
+		if err != nil {
+			return nil, err
+		}
 		return gcm.Open(nil, nonce, sealed, nil)
-	} else if security == 4 { // ChaCha20-Poly1305
-		aead, _ := chacha20poly1305.New(chachaKey(key[:16]))
+	} else if security == 4 {
+		aead, err := chacha20poly1305.New(chachaKey(key[:16]))
+		if err != nil {
+			return nil, err
+		}
 		return aead.Open(nil, nonce, sealed, nil)
 	}
 	return nil, fmt.Errorf("unsupported security: %d", security)
@@ -643,7 +682,8 @@ func sealAEAD(security byte, key, nonce, plain []byte) []byte {
 
 func chachaKey(k []byte) []byte {
 	a := md5.Sum(k)
-	return append(a[:], md5.Sum(a[:])[:]...)
+	b := md5.Sum(a[:])
+	return append(a[:], b[:]...)
 }
 
 // ==================== SHAKE128 ====================
@@ -652,7 +692,9 @@ type shakeParser struct {
 }
 
 func newShakeParser(seed []byte) *shakeParser {
-	return &shakeParser{shake: sha3.NewShake128()}
+	h := sha3.NewShake128()
+	h.Write(seed) // WAJIB: absorb seed
+	return &shakeParser{shake: h}
 }
 
 func (s *shakeParser) nextUint16() uint16 {
@@ -697,40 +739,44 @@ func (n *nonceCounter) next() []byte {
 	out[0] = byte(n.count >> 8)
 	out[1] = byte(n.count)
 	n.count++
+	if len(out) < 12 {
+		return out
+	}
 	return out[:12]
 }
 
 // ==================== Bridge ====================
 func bridge(ws *websocket.Conn, conn net.Conn) {
-	var wg sync.WaitGroup
-	wg.Add(2)
+	done := make(chan struct{}, 2)
 
-	// WS -> TCP
 	go func() {
-		defer wg.Done()
+		defer func() { done <- struct{}{} }()
 		for {
 			_, msg, err := ws.ReadMessage()
 			if err != nil {
 				return
 			}
-			conn.Write(msg)
+			if _, err := conn.Write(msg); err != nil {
+				return
+			}
 		}
 	}()
 
-	// TCP -> WS
 	go func() {
-		defer wg.Done()
+		defer func() { done <- struct{}{} }()
 		buf := make([]byte, 8192)
 		for {
 			n, err := conn.Read(buf)
 			if err != nil {
 				return
 			}
-			ws.WriteMessage(websocket.BinaryMessage, buf[:n])
+			if err := ws.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil {
+				return
+			}
 		}
 	}()
 
-	wg.Wait()
+	<-done
 	conn.Close()
 	ws.Close()
 }
@@ -749,8 +795,9 @@ func handleVMess(ws *websocket.Conn, msg []byte) bool {
 
 	decoder := newVMessDecoder(header)
 	encoder := newVMessEncoder(header)
-	respHeader := encodeVMessResponseHeader(header)
-	ws.WriteMessage(websocket.BinaryMessage, respHeader)
+	if err := ws.WriteMessage(websocket.BinaryMessage, encodeVMessResponseHeader(header)); err != nil {
+		return false
+	}
 
 	target := resolveHost(header.Address)
 	conn, err := net.Dial("tcp", net.JoinHostPort(target, fmt.Sprint(header.Port)))
@@ -770,12 +817,10 @@ func handleVMess(ws *websocket.Conn, msg []byte) bool {
 		}
 	}
 
-	var wg sync.WaitGroup
-	wg.Add(2)
+	done := make(chan struct{}, 2)
 
-	// WS -> TCP (decode)
 	go func() {
-		defer wg.Done()
+		defer func() { done <- struct{}{} }()
 		for {
 			_, data, err := ws.ReadMessage()
 			if err != nil {
@@ -786,14 +831,15 @@ func handleVMess(ws *websocket.Conn, msg []byte) bool {
 				return
 			}
 			for _, p := range plain {
-				conn.Write(p)
+				if _, err := conn.Write(p); err != nil {
+					return
+				}
 			}
 		}
 	}()
 
-	// TCP -> WS (encode)
 	go func() {
-		defer wg.Done()
+		defer func() { done <- struct{}{} }()
 		buf := make([]byte, 8192)
 		for {
 			n, err := conn.Read(buf)
@@ -802,12 +848,14 @@ func handleVMess(ws *websocket.Conn, msg []byte) bool {
 			}
 			encoded := encoder.encode(buf[:n])
 			if len(encoded) > 0 {
-				ws.WriteMessage(websocket.BinaryMessage, encoded)
+				if err := ws.WriteMessage(websocket.BinaryMessage, encoded); err != nil {
+					return
+				}
 			}
 		}
 	}()
 
-	wg.Wait()
+	<-done
 	conn.Close()
 	ws.Close()
 	return true
@@ -827,9 +875,8 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	path := r.URL.Path
 	var ok bool
-	switch path {
+	switch r.URL.Path {
 	case "/vless":
 		ok = handleVLESS(ws, msg)
 	case "/trojan":
@@ -866,15 +913,12 @@ func buildSubscription(r *http.Request) string {
 
 	var lines []string
 
-	// VLESS
 	lines = append(lines,
 		fmt.Sprintf("vless://%s@%s:443?path=%%2Fvless&security=tls&encryption=none&host=%s&fp=chrome&type=ws&sni=%s#%s-VLESS-TLS",
 			UUID, domain, wsHost, wsSNI, namePart),
 		fmt.Sprintf("vless://%s@%s:80?path=%%2Fvless&security=none&encryption=none&host=%s&type=ws#%s-VLESS-NTLS",
 			UUID, domain, wsHost, namePart),
 	)
-
-	// Trojan
 	lines = append(lines,
 		fmt.Sprintf("trojan://%s@%s:443?path=%%2Ftrojan&security=tls&host=%s&fp=chrome&type=ws&sni=%s#%s-Trojan-TLS",
 			UUID, domain, wsHost, wsSNI, namePart),
@@ -882,7 +926,6 @@ func buildSubscription(r *http.Request) string {
 			UUID, domain, wsHost, namePart),
 	)
 
-	// VMess TLS
 	vmessTLS := map[string]interface{}{
 		"v": "2", "ps": namePart + "-VMess-TLS",
 		"add": domain, "port": "443", "id": UUID, "aid": "0",
@@ -893,7 +936,6 @@ func buildSubscription(r *http.Request) string {
 	j, _ := json.Marshal(vmessTLS)
 	lines = append(lines, "vmess://"+base64.StdEncoding.EncodeToString(j))
 
-	// VMess NTLS
 	vmessNTLS := map[string]interface{}{
 		"v": "2", "ps": namePart + "-VMess-NTLS",
 		"add": domain, "port": "80", "id": UUID, "aid": "0",
@@ -917,12 +959,12 @@ func subHandler(w http.ResponseWriter, r *http.Request) {
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	info := map[string]interface{}{
-		"ok":         true,
-		"uuid":       UUID,
-		"sub_path":   SubPath,
+		"ok":          true,
+		"uuid":        UUID,
+		"sub_path":    SubPath,
 		"server_addr": ServerAddr,
-		"ws_host":    WSHost,
-		"ws_sni":     WSSNI,
+		"ws_host":     WSHost,
+		"ws_sni":      WSSNI,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(info)
