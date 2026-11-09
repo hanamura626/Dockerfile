@@ -1,0 +1,8 @@
+module vercel-proxy
+
+go 1.23
+
+require (
+    github.com/gorilla/websocket v1.5.3
+    golang.org/x/crypto v0.31.0
+)
